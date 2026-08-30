@@ -449,13 +449,16 @@ async function dispatch(userId, userMessage, replyToken) {
   userMessage = userMessage.replace(/[Tt]o[\s\-]?[Dd]o/g, 'TODO');
 
   // ── ambiguous_question への回答処理 ──────────────────────
-  // 前回「田中さんの件というのは？」などを返した場合、元メッセージ+回答でコンテキストに追加して再解釈
+  // 前回「田中さんの件というのは？」などを返した場合、元メッセージ+回答をこの1ターンだけ意図解析に渡して再解釈。
+  // ※parseIntentには通常は履歴を渡さない（履歴があると過去の操作を蒸し返すため）。あいまい再解釈時のみ下記を使う。
+  let ambiguityContext = [];
   if (session.pendingAmbiguous) {
     const { originalMessage } = session.pendingAmbiguous;
     session.pendingAmbiguous = null;
-    // 元のメッセージをlastMessagesに追加してコンテキストとして渡す
-    session.lastMessages.push({ role: 'user', content: originalMessage });
-    session.lastMessages.push({ role: 'assistant', content: 'どのような内容でしょうか？' });
+    ambiguityContext = [
+      { role: 'user', content: originalMessage },
+      { role: 'assistant', content: 'どのような内容でしょうか？' },
+    ];
     // userMessage（ユーザーの回答）はそのまま続けて処理
   }
 
@@ -817,8 +820,11 @@ async function dispatch(userId, userMessage, replyToken) {
   }
 
   // 意図解釈（AI）
+  // recentMessagesは原則空にする。履歴を渡すと過去の発話の操作（予定追加など）を蒸し返す性質があるため、
+  // 操作の振り分けは「今回の発話のみ」で判定する。指示語（それ/さっき）の解決は lastMentionedEmails/Events で行う。
+  // あいまい確認の再解釈のときだけ ambiguityContext（元発話）を渡す。
   const intent = await ai.parseIntent(userMessage, {
-    recentMessages:       session.lastMessages,
+    recentMessages:       ambiguityContext,
     pendingAction:        session.pendingAction,
     lastMentionedEmails:  session.lastEmails  || [],
     lastMentionedEvents:  session.lastEvents  || [],
@@ -873,6 +879,8 @@ async function dispatch(userId, userMessage, replyToken) {
         logger.error('dispatcher', 'multi-action error', { error: e.message });
       }
     }
+    // 追加系を実行したら会話履歴をクリア（単発追加と同様、次発話への文脈引きずり防止）
+    if (hasWriteAction) session.lastMessages = [];
     if (results.length > 0) {
       await lineClient.replyMessages(replyToken, results.slice(0, 5));
     } else {
@@ -1355,6 +1363,8 @@ async function dispatch(userId, userMessage, replyToken) {
         secretaryContext: getSecretaryContext(),
         recentMessages: (session.lastMessages || []).slice(0, -1), // 末尾=今の発話は consult 内で付与するので除く
       });
+      // 相談の発話が次の操作解釈に引きずられないよう履歴をクリア（操作↔相談の混線防止）
+      session.lastMessages = [];
       await lineClient.replyMessage(replyToken,
         answer || reply || 'すみません、うまく言葉が出てきませんでした。もう一度お願いできますか？');
       break;
@@ -1368,6 +1378,7 @@ async function dispatch(userId, userMessage, replyToken) {
         secretaryContext: getSecretaryContext(),
         recentMessages: (session.lastMessages || []).slice(0, -1),
       });
+      session.lastMessages = []; // 混線防止（consultと同様）
       const helpText = reply || UNKNOWN_REPLIES[Math.floor(Math.random() * UNKNOWN_REPLIES.length)];
       await lineClient.replyMessage(replyToken, answer || helpText);
     }

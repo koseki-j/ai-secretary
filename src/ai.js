@@ -297,6 +297,8 @@ ${lastMentionedEvents.length > 0
 
 ただし ambiguous は「予定・メール・TODOのどの操作か」が絞れない場合に限る。**予定・メール・TODOの操作ではなく、業務の相談・質問・意見だし・雑談（例：「10月の価格改定どう思う？」「原価率どう改善する？」「あけぼのの融資どうだっけ」「今日調子でないな」）は ambiguous でも unknown でもなく action:"consult" を返すこと**（reply は空でよい。consultハンドラが本文を生成する）。
 
+**【consultは必ず単独】** consult は他のアクションと同じ actions 配列に絶対に混ぜない。1つの発話は「操作（calendar/todo/gmail）」か「相談（consult）」のどちらか一方に分類する。会話履歴に過去の予定追加などが残っていても、**今回の発話が相談・質問なら consult 単独**を返し、履歴の予定を calendar_add で蒸し返さないこと。逆に今回が予定追加なら calendar_add 単独（consultを足さない）。
+
 操作系で、どの操作か特定できない場合のみ unknown でなく ambiguous:true にして、何を聞けば判断できるかを ambiguous_question に記載すること。
 
 例:
