@@ -24,9 +24,37 @@ async function withRetry(fn, maxRetries = 2, delayMs = 3000) {
   throw lastErr;
 }
 
+// 環境変数からカレンダー構成を読む。
+//   GOOGLE_CALENDAR_IDS = "koseki.ousama.yakiniku@gmail.com:王様, primary:個人"
+//     （カンマ区切り。各要素は "id" か "id:ラベル"。id はカレンダーID＝共有元のメールアドレス or "primary"）
+//   未設定なら従来どおり primary 1本（後方互換）。
+// カレンダーIDのメールアドレスに ":" は含まれないため、最初の ":" までを id、残りをラベルとする。
+function parseCalendarsEnv() {
+  const raw = process.env.GOOGLE_CALENDAR_IDS;
+  if (!raw || !raw.trim()) {
+    return [{ id: 'primary', label: '' }];
+  }
+  return raw.split(',').map(s => s.trim()).filter(Boolean).map(entry => {
+    const idx = entry.indexOf(':');
+    if (idx === -1) return { id: entry, label: '' };
+    return { id: entry.slice(0, idx).trim(), label: entry.slice(idx + 1).trim() };
+  });
+}
+
 class GoogleCalendarClient {
   constructor() {
-    this.calendarId = 'primary';
+    this.calendars = parseCalendarsEnv();
+    const def = process.env.GOOGLE_DEFAULT_CALENDAR_ID;
+    this.defaultCalendarId = def && def.trim() ? def.trim() : this.calendars[0].id;
+    const defCal = this.calendars.find(c => c.id === this.defaultCalendarId);
+    this.defaultLabel = defCal ? defCal.label : '';
+    // 後方互換のエイリアス（旧コードが this.calendarId を参照しても壊れないように）
+    this.calendarId = this.defaultCalendarId;
+  }
+
+  labelFor(id) {
+    const c = this.calendars.find(x => x.id === id);
+    return c ? c.label : '';
   }
 
   async _getCalendar() {
@@ -34,51 +62,55 @@ class GoogleCalendarClient {
     return google.calendar({ version: 'v3', auth });
   }
 
+  _mapEvent(e, cal) {
+    return {
+      id: e.id,
+      title: e.summary || '（タイトルなし）',
+      start: e.start?.dateTime || e.start?.date,
+      end: e.end?.dateTime || e.end?.date,
+      location: e.location || '',
+      description: e.description || '',
+      calendarId: cal.id,
+      calLabel: cal.label,
+    };
+  }
+
+  // 全カレンダーを横断して events.list を実行しマージ（1カレンダーが失敗しても他は返す）
+  async _listAcross(params) {
+    const calendar = await this._getCalendar();
+    const all = [];
+    for (const cal of this.calendars) {
+      try {
+        const res = await withRetry(() => calendar.events.list({ ...params, calendarId: cal.id }));
+        for (const e of (res?.data?.items || [])) {
+          all.push(this._mapEvent(e, cal));
+        }
+      } catch (e) {
+        logger.warn('calendar', `events.list失敗（${cal.id}）`, { error: e.message });
+      }
+    }
+    all.sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+    return all;
+  }
+
   async listEvents(date, rangeDays = 1) {
-    return withRetry(async () => {
-      const calendar = await this._getCalendar();
-      const start = new Date(`${date}T00:00:00+09:00`);
-      const end = new Date(start);
-      end.setDate(end.getDate() + rangeDays);
-
-      const res = await calendar.events.list({
-        calendarId: this.calendarId,
-        timeMin: start.toISOString(),
-        timeMax: end.toISOString(),
-        singleEvents: true,
-        orderBy: 'startTime',
-      });
-
-      return (res?.data?.items || []).map(e => ({
-        id: e.id,
-        title: e.summary || '（タイトルなし）',
-        start: e.start?.dateTime || e.start?.date,
-        end: e.end?.dateTime || e.end?.date,
-        location: e.location || '',
-        description: e.description || '',
-      }));
+    const start = new Date(`${date}T00:00:00+09:00`);
+    const end = new Date(start);
+    end.setDate(end.getDate() + rangeDays);
+    return this._listAcross({
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
     });
   }
 
   async checkConflict(start, end) {
-    return withRetry(async () => {
-      const calendar = await this._getCalendar();
-      // 境界値（ぴったり終わる/始まる）を重複と判定しないよう1分のバッファを設ける
-      const tMin = new Date(new Date(start).getTime() + 60000).toISOString();
-      const tMax = new Date(new Date(end).getTime() - 60000).toISOString();
-      const res = await calendar.events.list({
-        calendarId: this.calendarId,
-        timeMin: tMin,
-        timeMax: tMax,
-        singleEvents: true,
-      });
-      return (res?.data?.items || []).map(e => ({
-        id: e.id,
-        title: e.summary || '（タイトルなし）',
-        start: e.start?.dateTime || e.start?.date,
-        end: e.end?.dateTime || e.end?.date,
-      }));
-    });
+    // 境界値（ぴったり終わる/始まる）を重複と判定しないよう1分のバッファを設ける
+    const tMin = new Date(new Date(start).getTime() + 60000).toISOString();
+    const tMax = new Date(new Date(end).getTime() - 60000).toISOString();
+    // 全カレンダーを横断して重複検知（個人と店の予定衝突も拾う）
+    return this._listAcross({ timeMin: tMin, timeMax: tMax, singleEvents: true });
   }
 
   async addEvent(title, start, end, description = '') {
@@ -89,36 +121,17 @@ class GoogleCalendarClient {
     if (conflicts.length > 0) {
       return { success: false, conflict: conflicts, event: null };
     }
-
-    return withRetry(async () => {
-      const calendar = await this._getCalendar();
-      const res = await calendar.events.insert({
-        calendarId: this.calendarId,
-        requestBody: {
-          summary: title,
-          description,
-          start: { dateTime: start, timeZone: 'Asia/Tokyo' },
-          end: { dateTime: end, timeZone: 'Asia/Tokyo' },
-        },
-      });
-
-      return {
-        success: true,
-        conflict: [],
-        event: {
-          id: res?.data?.id,
-          title: res?.data?.summary,
-          start: res?.data?.start?.dateTime,
-          end: res?.data?.end?.dateTime,
-        },
-      };
-    });
+    return this.addEventForce(title, start, end, description).then(r => ({
+      success: true, conflict: [], event: r.event,
+    }));
   }
 
-  async addEventForce(title, start, end, description = '', location = '') {
+  // 新規予定を追加。calendarId 未指定なら既定カレンダー（GOOGLE_DEFAULT_CALENDAR_ID）へ。
+  async addEventForce(title, start, end, description = '', location = '', calendarId = null) {
     if (new Date(start) >= new Date(end)) {
       throw new Error('終了時刻が開始時刻より前または同じです');
     }
+    const targetId = calendarId || this.defaultCalendarId;
     return withRetry(async () => {
       const calendar = await this._getCalendar();
       const requestBody = {
@@ -128,10 +141,7 @@ class GoogleCalendarClient {
         end: { dateTime: end, timeZone: 'Asia/Tokyo' },
       };
       if (location) requestBody.location = location;
-      const res = await calendar.events.insert({
-        calendarId: this.calendarId,
-        requestBody,
-      });
+      const res = await calendar.events.insert({ calendarId: targetId, requestBody });
       return {
         success: true,
         event: {
@@ -139,60 +149,49 @@ class GoogleCalendarClient {
           title: res?.data?.summary,
           start: res?.data?.start?.dateTime,
           end: res?.data?.end?.dateTime,
+          calendarId: targetId,
+          calLabel: this.labelFor(targetId),
         },
       };
     });
   }
 
-  // キーワード・日付でイベント検索（delete/update前の検索用）
+  // キーワード・日付でイベント検索（delete/update前の検索用）。全カレンダー横断。
   async searchEvents(keyword, dateStr = null) {
-    return withRetry(async () => {
-      const now = new Date();
-      const from = dateStr
-        ? new Date(`${dateStr}T00:00:00+09:00`)
-        : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7); // 1週間前から
-      const to = dateStr
-        ? new Date(`${dateStr}T23:59:59+09:00`)
-        : new Date(from.getTime() + 30 * 24 * 60 * 60 * 1000); // 30日間
-
-      const calendar = await this._getCalendar();
-      const res = await calendar.events.list({
-        calendarId: this.calendarId,
-        timeMin: from.toISOString(),
-        timeMax: to.toISOString(),
-        singleEvents: true,
-        orderBy: 'startTime',
-        q: keyword, // Google Calendar APIの全文検索
-      });
-      return (res?.data?.items || []).map(e => ({
-        id: e.id,
-        title: e.summary || '（タイトルなし）',
-        start: e.start?.dateTime || e.start?.date,
-        end: e.end?.dateTime || e.end?.date,
-      }));
+    const now = new Date();
+    const from = dateStr
+      ? new Date(`${dateStr}T00:00:00+09:00`)
+      : new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7); // 1週間前から
+    const to = dateStr
+      ? new Date(`${dateStr}T23:59:59+09:00`)
+      : new Date(from.getTime() + 30 * 24 * 60 * 60 * 1000); // 30日間
+    return this._listAcross({
+      timeMin: from.toISOString(),
+      timeMax: to.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+      q: keyword, // Google Calendar APIの全文検索
     });
   }
 
-  async deleteEvent(eventId) {
+  async deleteEvent(eventId, calendarId = null) {
+    const targetId = calendarId || this.defaultCalendarId;
     return withRetry(async () => {
       const calendar = await this._getCalendar();
-      await calendar.events.delete({ calendarId: this.calendarId, eventId });
+      await calendar.events.delete({ calendarId: targetId, eventId });
       return { success: true };
     });
   }
 
-  async updateEvent(eventId, updates = {}) {
+  async updateEvent(eventId, updates = {}, calendarId = null) {
+    const targetId = calendarId || this.defaultCalendarId;
     return withRetry(async () => {
       const calendar = await this._getCalendar();
       const body = {};
       if (updates.title) body.summary = updates.title;
       if (updates.start) body.start = { dateTime: updates.start, timeZone: 'Asia/Tokyo' };
       if (updates.end)   body.end   = { dateTime: updates.end,   timeZone: 'Asia/Tokyo' };
-      const res = await calendar.events.patch({
-        calendarId: this.calendarId,
-        eventId,
-        requestBody: body,
-      });
+      const res = await calendar.events.patch({ calendarId: targetId, eventId, requestBody: body });
       return {
         success: true,
         event: {
@@ -200,18 +199,21 @@ class GoogleCalendarClient {
           title: res?.data?.summary,
           start: (res?.data?.start || {}).dateTime || (res?.data?.start || {}).date,
           end:   (res?.data?.end   || {}).dateTime || (res?.data?.end   || {}).date,
+          calendarId: targetId,
+          calLabel: this.labelFor(targetId),
         },
       };
     });
   }
 
-  // 毎月第N曜日などの繰り返しカレンダーイベントを作成
+  // 毎月第N曜日などの繰り返しカレンダーイベントを作成（既定カレンダーへ）
   // rrule例: "FREQ=MONTHLY;BYDAY=2FR" （毎月第2金曜）
-  async addRecurringEvent(title, rrule, startDate, startTime = '09:00', endTime = '09:30', description = '') {
+  async addRecurringEvent(title, rrule, startDate, startTime = '09:00', endTime = '09:30', description = '', calendarId = null) {
+    const targetId = calendarId || this.defaultCalendarId;
     return withRetry(async () => {
       const calendar = await this._getCalendar();
       const res = await calendar.events.insert({
-        calendarId: this.calendarId,
+        calendarId: targetId,
         requestBody: {
           summary: title,
           description,
@@ -222,7 +224,7 @@ class GoogleCalendarClient {
       });
       return {
         success: true,
-        event: { id: res?.data?.id, title: res?.data?.summary, rrule },
+        event: { id: res?.data?.id, title: res?.data?.summary, rrule, calendarId: targetId },
       };
     });
   }

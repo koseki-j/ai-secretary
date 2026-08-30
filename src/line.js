@@ -151,7 +151,8 @@ function formatCalendarEvents(events, dateLabel = '', rangeDays = 1) {
         const s = e.start ? _formatTime(e.start) : '';
         const en = e.end ? _formatTime(e.end) : '';
         const timeStr = s && en ? `  ${s}〜${en} ` : '  ';
-        lines.push(`${timeStr}${e.title}`);
+        const tag = e.calLabel ? `[${e.calLabel}] ` : '';
+        lines.push(`${timeStr}${tag}${e.title}`);
       }
     }
     return lines.join('\n');
@@ -166,7 +167,8 @@ function formatCalendarEvents(events, dateLabel = '', rangeDays = 1) {
     const start = e.start ? _formatTime(e.start) : '';
     const end = e.end ? _formatTime(e.end) : '';
     const timeStr = start && end ? `${start}〜${end} ` : '';
-    lines.push(`${timeStr}${e.title}`);
+    const tag = e.calLabel ? `[${e.calLabel}] ` : '';
+    lines.push(`${timeStr}${tag}${e.title}`);
   }
   return lines.join('\n');
 }

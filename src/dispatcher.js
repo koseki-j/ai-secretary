@@ -220,10 +220,11 @@ async function executePending(session, replyToken) {
     case 'calendar_add_force': {
       const { title, start, end, description, location } = pendingData;
       try {
-        await calendarClient.addEventForce(title, start, end, description || '', location || '');
+        const r = await calendarClient.addEventForce(title, start, end, description || '', location || '');
         const label = formatEventLabel({ start, end });
         const locLine = location ? `\n📍 ${location}` : '';
-        await lineClient.replyMessage(replyToken, `✅ カレンダーに登録しました\n${title}\n${label}${locLine}`);
+        const calLine = r?.event?.calLabel ? `\n🗂 ${r.event.calLabel}` : '';
+        await lineClient.replyMessage(replyToken, `✅ カレンダーに登録しました\n${title}\n${label}${calLine}${locLine}`);
       } catch (e) {
         await lineClient.replyMessage(replyToken, `❌ 追加に失敗しました: ${e.message}`);
       }
@@ -242,9 +243,9 @@ async function executePending(session, replyToken) {
     }
 
     case 'calendar_delete': {
-      const { eventId } = pendingData;
+      const { eventId, calendarId } = pendingData;
       try {
-        await calendarClient.deleteEvent(eventId);
+        await calendarClient.deleteEvent(eventId, calendarId);
         await lineClient.replyMessage(replyToken, '🗑 削除しました');
       } catch (e) {
         await lineClient.replyMessage(replyToken, `削除に失敗しました: ${e.message}`);
@@ -264,9 +265,9 @@ async function executePending(session, replyToken) {
     }
 
     case 'calendar_update': {
-      const { eventId, updates } = pendingData;
+      const { eventId, updates, calendarId } = pendingData;
       try {
-        const result = await calendarClient.updateEvent(eventId, updates);
+        const result = await calendarClient.updateEvent(eventId, updates, calendarId);
         const label = formatEventLabel({ start: result.event.start, end: result.event.end });
         await lineClient.replyMessage(replyToken, `✅ 変更しました\n${result.event.title}\n${label}`);
       } catch (e) {
@@ -338,7 +339,8 @@ async function resolveActionText(actionItem, session, userMessage) {
       for (const e of events) {
         const s = e.start ? new Date(e.start).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
         const en = e.end ? new Date(e.end).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
-        lines.push(`${s && en ? `${s}〜${en} ` : ''}${e.title}`);
+        const tag = e.calLabel ? `[${e.calLabel}] ` : '';
+        lines.push(`${s && en ? `${s}〜${en} ` : ''}${tag}${e.title}`);
       }
       return lines.join('\n');
     }
@@ -916,7 +918,8 @@ async function dispatch(userId, userMessage, replyToken) {
         for (const e of events) {
           const s  = e.start ? new Date(e.start).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
           const en = e.end   ? new Date(e.end).toLocaleTimeString('ja-JP',   { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false }) : '';
-          lines.push(`🔴 ${s && en ? `${s}〜${en} ` : ''}${e.title}`);
+          const tag = e.calLabel ? `[${e.calLabel}] ` : '';
+          lines.push(`🔴 ${s && en ? `${s}〜${en} ` : ''}${tag}${e.title}`);
         }
         await lineClient.replyMessage(replyToken, lines.join('\n'));
       } catch (e) {
@@ -935,14 +938,18 @@ async function dispatch(userId, userMessage, replyToken) {
 
         const label = formatEventLabel(params);
         const locLine = params.location ? `\n📍 ${params.location}` : '';
+        const calLine = calendarClient.defaultLabel ? `\n🗂 ${calendarClient.defaultLabel}` : '';
         if (conflicts.length > 0) {
-          const conflictNames = conflicts.map(c => c.title).join('、');
+          const conflictNames = conflicts.map(c => {
+            const t = c.calLabel ? `[${c.calLabel}] ` : '';
+            return `${t}${c.title}`;
+          }).join('、');
           setPending(session, 'calendar_add_force', params);
-          await lineClient.replyMessage(replyToken, `⚠️ 重複があります\n「${conflictNames}」が入っています。それでも追加しますか？\n\n${params.title}\n${label}${locLine}`);
+          await lineClient.replyMessage(replyToken, `⚠️ 重複があります\n「${conflictNames}」が入っています。それでも追加しますか？\n\n${params.title}\n${label}${calLine}${locLine}`);
           return;
         }
         setPending(session, 'calendar_add', params);
-        await lineClient.replyMessage(replyToken, `「${params.title}」を\n${label}に追加してよいですか？${locLine}`);
+        await lineClient.replyMessage(replyToken, `「${params.title}」を\n${label}${calLine}\nに追加してよいですか？${locLine}`);
       } catch (e) {
         await lineClient.replyMessage(replyToken, `カレンダー追加に失敗しました: ${e.message}`);
       }
@@ -960,13 +967,15 @@ async function dispatch(userId, userMessage, replyToken) {
         if (found.length === 1) {
           const ev = found[0];
           const label = formatEventLabel({ start: ev.start, end: ev.end });
-          setPending(session, 'calendar_delete', { eventId: ev.id });
-          await lineClient.replyMessage(replyToken, `この予定を削除しますか？\n「${ev.title}」\n${label}`);
+          const calTag = ev.calLabel ? `[${ev.calLabel}] ` : '';
+          setPending(session, 'calendar_delete', { eventId: ev.id, calendarId: ev.calendarId });
+          await lineClient.replyMessage(replyToken, `この予定を削除しますか？\n${calTag}「${ev.title}」\n${label}`);
         } else {
           // 複数ヒット → 最初の3件を表示して絞り込み依頼
           const list = found.slice(0, 3).map((ev, i) => {
             const label = formatEventLabel({ start: ev.start, end: ev.end });
-            return `${NUM_CHARS[i]} ${ev.title} ${label}`;
+            const calTag = ev.calLabel ? `[${ev.calLabel}] ` : '';
+            return `${NUM_CHARS[i]} ${calTag}${ev.title} ${label}`;
           }).join('\n');
           session.lastEvents = found.slice(0, 3);
           await lineClient.replyMessage(replyToken, `複数の予定が見つかりました。どれを削除しますか？\n${list}`);
@@ -1004,9 +1013,10 @@ async function dispatch(userId, userMessage, replyToken) {
         const newStart = updates.start || ev.start;
         const newEnd   = updates.end   || ev.end;
         const label = formatEventLabel({ start: newStart, end: newEnd });
-        setPending(session, 'calendar_update', { eventId: ev.id, updates });
+        const calTag = ev.calLabel ? `[${ev.calLabel}] ` : '';
+        setPending(session, 'calendar_update', { eventId: ev.id, updates, calendarId: ev.calendarId });
         await lineClient.replyMessage(replyToken,
-          `「${ev.title}」を以下の内容に変更してよいですか？\n${label}`);
+          `${calTag}「${ev.title}」を以下の内容に変更してよいですか？\n${label}`);
       } catch (e) {
         await lineClient.replyMessage(replyToken, `カレンダー変更に失敗しました: ${e.message}`);
       }
