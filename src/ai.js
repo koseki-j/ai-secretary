@@ -183,6 +183,7 @@ todo_delete_by_title  | titles:[]
 todo_note             | keyword, note
 todo_setup_recurring  | todos:[], reminder_title, reminder_rrule, reminder_description
 briefing              | {}
+consult               | {}（予定/メール/TODOのどれにも当てはまらない業務相談・質問・意見だし・雑談。会長の焼肉/不動産の相談はこれ）
 unknown               | {}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -294,7 +295,9 @@ ${lastMentionedEvents.length > 0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## ambiguous（判断不能）の処理
 
-actionが特定できない場合は unknown でなく ambiguous:true にして、何を聞けば判断できるかを ambiguous_question に記載すること。
+ただし ambiguous は「予定・メール・TODOのどの操作か」が絞れない場合に限る。**予定・メール・TODOの操作ではなく、業務の相談・質問・意見だし・雑談（例：「10月の価格改定どう思う？」「原価率どう改善する？」「あけぼのの融資どうだっけ」「今日調子でないな」）は ambiguous でも unknown でもなく action:"consult" を返すこと**（reply は空でよい。consultハンドラが本文を生成する）。
+
+操作系で、どの操作か特定できない場合のみ unknown でなく ambiguous:true にして、何を聞けば判断できるかを ambiguous_question に記載すること。
 
 例:
 - 「田中さんの件どうする？」→ { ambiguous:true, ambiguous_question:"田中さんの件というのは、予定・メール・TODOのどれでしょうか？" }
@@ -401,6 +404,54 @@ actionが特定できない場合は unknown でなく ambiguous:true にして�
   }
 }
 
+// ────────────────────────────────────────────────────────────
+// 相談モード：予定/メール/TODO以外の業務相談・質問・雑談に、
+// 「秘書の記憶（業務ブリーフ）」を背景に持って自然文で答える。
+// ────────────────────────────────────────────────────────────
+async function consult(userMessage, options = {}) {
+  const { secretaryContext = '', recentMessages = [] } = options;
+  const now = jstNow();
+  const dowFull = WEEKDAY_JA[now.getDay()];
+
+  const memorySection = secretaryContext
+    ? `## あなたが持っている記憶・前提（会長の事業状況）\n${secretaryContext}`
+    : `（記憶がまだ設定されていません。その場合はその旨を一言添え、一般的な範囲で丁寧に答えてください）`;
+
+  const systemPrompt = `あなたは小関淳さん（本人の希望で「会長」と呼ぶ）の専属AI秘書です。会長は山形で焼肉店（王様の焼肉／大衆焼肉けむすけ）を経営し、不動産賃貸も手掛ける大家です。あなたの背後にはCFO兼経営企画・不動産財務・命術/養生顧問のチームがいる想定で、窓口としてまとめて答えます。
+
+現在日時(JST): ${toDateStr(now)}（${dowFull}）
+
+## 応答スタイル
+- LINEでのやり取りなので簡潔・実務的に。必要なら箇条書き。長くなりすぎない。
+- 参謀であって決裁者ではない。判断材料と選択肢を示し、最終判断は会長に委ねる。
+- 数字は目的の手段。可能なら「この一手が守りたい人・時間にどう効くか」も一言添える。
+- 税務の確定判断はしない（顧問税理士の領分）。分からないこと・最新の数字が要ることは断定せず、「PCの資料で確認しましょう」等と正直に促す。
+- あなたはLINE上の秘書で、PC内のファイルやGoogleドライブの中身はまだ直接読めない。資料本体が要る質問はその旨を伝える。
+
+${memorySection}`;
+
+  const messages = [];
+  for (const m of recentMessages.slice(-4)) messages.push(m);
+  messages.push({ role: 'user', content: userMessage });
+
+  try {
+    const response = await withTimeout(
+      client.messages.create({
+        model: MODEL,
+        max_tokens: 1200,
+        system: systemPrompt,
+        messages,
+      }),
+      30000,
+      'Claude API タイムアウト（30秒）'
+    );
+    return response?.content?.[0]?.text?.trim() || '';
+  } catch (err) {
+    logger.error('ai', 'consult error', { error: err.message });
+    return '';
+  }
+}
+
 async function generateReply(systemPrompt, userMessage) {
   try {
     const response = await withTimeout(
@@ -420,7 +471,7 @@ async function generateReply(systemPrompt, userMessage) {
   }
 }
 
-module.exports = { parseIntent, generateReply };
+module.exports = { parseIntent, generateReply, consult };
 
 // ────────────────────────────────────────────────────────────
 // テスト実行: node src/ai.js

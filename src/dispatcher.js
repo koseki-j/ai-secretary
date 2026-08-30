@@ -5,6 +5,7 @@ const { GmailClient } = require('./gmail');
 const todo = require('./todo');
 const { LineClient, formatCalendarEvents, formatGmailList } = require('./line');
 const briefing = require('./briefing');
+const { getSecretaryContext } = require('./context');
 const logger = require('./lib/logger');
 
 const sessions = new Map();
@@ -1331,10 +1332,26 @@ async function dispatch(userId, userMessage, replyToken) {
       break;
     }
 
+    case 'consult': {
+      // 相談モード：秘書の記憶を背景に自然文で回答
+      const answer = await ai.consult(userMessage, {
+        secretaryContext: getSecretaryContext(),
+        recentMessages: (session.lastMessages || []).slice(0, -1), // 末尾=今の発話は consult 内で付与するので除く
+      });
+      await lineClient.replyMessage(replyToken,
+        answer || reply || 'すみません、うまく言葉が出てきませんでした。もう一度お願いできますか？');
+      break;
+    }
+
     case 'unknown':
     default: {
+      // 操作意図が無い発話は相談モードで拾う（記憶があれば秘書として回答）
+      const answer = await ai.consult(userMessage, {
+        secretaryContext: getSecretaryContext(),
+        recentMessages: (session.lastMessages || []).slice(0, -1),
+      });
       const helpText = reply || UNKNOWN_REPLIES[Math.floor(Math.random() * UNKNOWN_REPLIES.length)];
-      await lineClient.replyMessage(replyToken, helpText);
+      await lineClient.replyMessage(replyToken, answer || helpText);
     }
   }
 }
