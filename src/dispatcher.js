@@ -224,6 +224,7 @@ async function executePending(session, replyToken) {
         const label = formatEventLabel({ start, end });
         const locLine = location ? `\n📍 ${location}` : '';
         const calLine = r?.event?.calLabel ? `\n🗂 ${r.event.calLabel}` : '';
+        session.lastMessages = []; // 追加後は会話履歴をクリア（タイトルの次発話への混入防止）
         await lineClient.replyMessage(replyToken, `✅ カレンダーに登録しました\n${title}\n${label}${calLine}${locLine}`);
       } catch (e) {
         await lineClient.replyMessage(replyToken, `❌ 追加に失敗しました: ${e.message}`);
@@ -945,10 +946,14 @@ async function dispatch(userId, userMessage, replyToken) {
             return `${t}${c.title}`;
           }).join('、');
           setPending(session, 'calendar_add_force', params);
+          // 確認待ちにした予定タイトルが次の発話解釈に混入しないよう会話履歴をクリア（todo_addと同様）
+          session.lastMessages = [];
           await lineClient.replyMessage(replyToken, `⚠️ 重複があります\n「${conflictNames}」が入っています。それでも追加しますか？\n\n${params.title}\n${label}${calLine}${locLine}`);
           return;
         }
         setPending(session, 'calendar_add', params);
+        // 確認待ちにした予定タイトルが次の発話解釈に混入しないよう会話履歴をクリア（todo_addと同様）
+        session.lastMessages = [];
         await lineClient.replyMessage(replyToken, `「${params.title}」を\n${label}${calLine}\nに追加してよいですか？${locLine}`);
       } catch (e) {
         await lineClient.replyMessage(replyToken, `カレンダー追加に失敗しました: ${e.message}`);
@@ -1343,6 +1348,8 @@ async function dispatch(userId, userMessage, replyToken) {
     }
 
     case 'consult': {
+      // 相談モードに入った＝直前の確認フローは離脱とみなし、保留中の操作を解除（stale pendingの誤発火防止）
+      if (session.pendingAction) clearPending(session);
       // 相談モード：秘書の記憶を背景に自然文で回答
       const answer = await ai.consult(userMessage, {
         secretaryContext: getSecretaryContext(),
@@ -1355,6 +1362,7 @@ async function dispatch(userId, userMessage, replyToken) {
 
     case 'unknown':
     default: {
+      if (session.pendingAction) clearPending(session);
       // 操作意図が無い発話は相談モードで拾う（記憶があれば秘書として回答）
       const answer = await ai.consult(userMessage, {
         secretaryContext: getSecretaryContext(),
